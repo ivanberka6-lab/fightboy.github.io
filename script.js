@@ -1,22 +1,3 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-import {
-  getDatabase, ref, set, get, onValue, update, remove, onDisconnect, serverTimestamp
-} from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
-
-/* ========== 🔧 FIREBASE CONFIG — ЗАМЕНИ НА СВОЙ ========== */
-const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT.firebaseapp.com",
-  databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
-  projectId: "YOUR_PROJECT",
-  storageBucket: "YOUR_PROJECT.appspot.com",
-  messagingSenderId: "000000000000",
-  appId: "1:000000000000:web:xxxxxxxxxxxxxxxx"
-};
-
-const app = initializeApp(firebaseConfig);
-const db = getDatabase(app);
-
 /* ========== КОНСТАНТЫ ========== */
 const SIZE = 10;
 const FLEET = [
@@ -28,29 +9,30 @@ const FLEET = [
 
 /* ========== СОСТОЯНИЕ ========== */
 const state = {
-  playerId: null,        // 'player1' | 'player2'
+  peer: null,
+  conn: null,
+  isHost: false,
+  myId: null,
   roomCode: null,
-  myBoard: [],           // 0=empty, 1=ship
-  enemyBoardView: [],    // 0=unknown, 1=miss, 2=hit, 3=sunk
-  myShotsOnEnemy: [],    // [y][x] = 0/1/2/3
+  myBoard: [],
+  myShotsOnEnemy: [],
   enemyShotsOnMe: [],
-  ships: [],             // {len, cells:[{x,y}], sunk:false}
-  placingShip: null,     // индекс выбранного корабля
+  ships: [],
+  placingShip: null,
   horizontal: true,
-  ready: false,
+  placedHistory: [],
+  myReady: false,
   enemyReady: false,
-  gameState: 'waiting',
+  gameState: 'menu',
   myTurn: false,
-  roomRef: null,
-  enemyId: null,
-  shotHistory: []
+  pendingShot: null
 };
 
 /* ========== УТИЛИТЫ ========== */
 const $ = id => document.getElementById(id);
 const rand = n => Math.floor(Math.random() * n);
-const randomCode = () => {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const generateCode = () => {
+  const chars = 'abcdefghijkmnpqrstuvwxyz23456789';
   let s = '';
   for (let i = 0; i < 6; i++) s += chars[rand(chars.length)];
   return s;
@@ -61,7 +43,7 @@ function showScreen(id) {
   $(id).classList.add('active');
 }
 
-/* ========== ЗВУКИ (Web Audio) ========== */
+/* ========== ЗВУКИ ========== */
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 function beep(freq, dur = 0.1, type = 'sine', vol = 0.1) {
   try {
@@ -90,94 +72,120 @@ const sfx = {
 };
 
 /* ========== МЕНЮ ========== */
-$('btn-create').onclick = async () => {
-  const code = randomCode();
-  state.roomCode = code;
-  state.playerId = 'player1';
-  state.enemyId = 'player2';
-  state.roomRef = ref(db, 'rooms/' + code);
+$('btn-create').onclick = () => {
+  $('btn-create').disabled = true;
+  $('btn-join').disabled = true;
 
-  await set(state.roomRef, {
-    state: 'waiting',
-    turn: 'player1',
-    winner: null,
-    createdAt: serverTimestamp(),
-    player1: { ready: false, board: null, shots: null, connected: true },
-    player2: { ready: false, board: null, shots: null, connected: false }
+  const code = generateCode();
+  state.isHost = true;
+  state.roomCode = code;
+
+  try {
+    state.peer = new Peer('bs-' + code);
+  } catch (e) {
+    alert('Ошибка PeerJS: ' + e.message);
+    $('btn-create').disabled = false;
+    $('btn-join').disabled = false;
+    return;
+  }
+
+  state.peer.on('open', () => {
+    state.myId = state.peer.id;
+    $('room-code-display').textContent = code.toUpperCase();
+    $('room-info').classList.remove('hidden');
+    $('room-status').textContent = '⏳ Ожидание соперника...';
   });
 
-  onDisconnect(ref(db, `rooms/${code}/player1/connected`)).set(false);
+  state.peer.on('connection', (conn) => {
+    if (state.conn) { conn.close(); return; }
+    state.conn = conn;
+    setupConn(conn);
+    $('room-status').textContent = '✅ Соперник найден, соединяемся...';
+  });
 
-  $('room-code-display').textContent = code;
-  $('room-info').classList.remove('hidden');
-  subscribeRoom();
+  state.peer.on('error', (err) => {
+    console.error('PeerJS:', err);
+    if (err.type === 'unavailable-id') {
+      state.peer.destroy();
+      setTimeout(() => $('btn-create').click(), 100);
+    } else {
+      alert('Ошибка: ' + err.type + '\n' + (err.message || ''));
+    }
+  });
 };
 
-$('btn-join').onclick = async () => {
-  const code = $('input-code').value.trim().toUpperCase();
+$('btn-join').onclick = () => {
+  const code = $('input-code').value.trim().toLowerCase();
   if (code.length !== 6) return alert('Введите 6-символьный код');
 
-  const roomSnap = await get(ref(db, 'rooms/' + code));
-  if (!roomSnap.exists()) return alert('Комната не найдена');
-
-  const room = roomSnap.val();
-  if (room.player2 && room.player2.connected) return alert('Комната занята');
-
+  $('btn-create').disabled = true;
+  $('btn-join').disabled = true;
+  state.isHost = false;
   state.roomCode = code;
-  state.playerId = 'player2';
-  state.enemyId = 'player1';
-  state.roomRef = ref(db, 'rooms/' + code);
+  state.peer = new Peer();
 
-  await update(ref(db, `rooms/${code}/player2`), { connected: true });
-  await update(ref(db, `rooms/${code}`), { state: 'placing' });
+  $('room-code-display').textContent = code.toUpperCase();
+  $('room-info').classList.remove('hidden');
+  $('room-status').textContent = '🔄 Подключение к серверу...';
 
-  onDisconnect(ref(db, `rooms/${code}/player2/connected`)).set(false);
+  state.peer.on('open', () => {
+    state.myId = state.peer.id;
+    $('room-status').textContent = '🔄 Ищем комнату...';
+    state.conn = state.peer.connect('bs-' + code, { reliable: true });
+    setupConn(state.conn);
+  });
 
-  subscribeRoom();
+  state.peer.on('error', (err) => {
+    console.error('PeerJS:', err);
+    if (err.type === 'peer-unavailable') {
+      alert('Комната не найдена. Проверь код.');
+      $('btn-create').disabled = false;
+      $('btn-join').disabled = false;
+      $('room-info').classList.add('hidden');
+    } else {
+      alert('Ошибка: ' + err.type);
+    }
+  });
 };
 
 $('btn-copy').onclick = () => {
-  navigator.clipboard.writeText(state.roomCode);
+  navigator.clipboard.writeText(state.roomCode.toUpperCase());
   $('btn-copy').textContent = '✅ Скопировано';
   setTimeout(() => $('btn-copy').textContent = '📋 Копировать код', 1500);
 };
 
-/* ========== ПОДПИСКА НА КОМНАТУ ========== */
-function subscribeRoom() {
-  onValue(state.roomRef, snap => {
-    const room = snap.val();
-    if (!room) return;
-
-    // Ожидание второго игрока
-    if (state.playerId === 'player1') {
-      if (room.player2 && room.player2.connected) {
-        $('room-status').textContent = '✅ Соперник подключён!';
-        setTimeout(() => startPlacing(), 500);
-      } else {
-        $('room-status').textContent = '⏳ Ожидание соперника...';
-      }
-    } else if (state.playerId === 'player2' && room.state === 'placing') {
-      startPlacing();
-    }
-
-    // Проверка готовности обоих
-    if (room.player1?.ready && room.player2?.ready && room.state !== 'playing' && room.state !== 'finished') {
-      update(ref(db, `rooms/${state.roomCode}`), { state: 'playing' });
-    }
-
-    // Обработка выстрелов соперника
-    if (room.state === 'playing' || room.state === 'finished') {
-      if (!state.gameState || state.gameState === 'waiting' || state.gameState === 'placing') {
-        enterBattle(room);
-      }
-      syncBattle(room);
-    }
-
-    if (room.state === 'finished' && state.gameState !== 'finished') {
-      state.gameState = 'finished';
-      showResult(room.winner === state.playerId);
+/* ========== СОЕДИНЕНИЕ ========== */
+function setupConn(conn) {
+  conn.on('open', () => {
+    $('room-status').textContent = '✅ Подключено!';
+    setTimeout(() => startPlacing(), 400);
+  });
+  conn.on('data', handleMessage);
+  conn.on('close', () => {
+    if (state.gameState === 'battle' || state.gameState === 'placing') {
+      alert('Соперник отключился');
+      setTimeout(() => location.reload(), 100);
     }
   });
+  conn.on('error', (e) => console.error('Conn error:', e));
+}
+
+function handleMessage(msg) {
+  switch (msg.type) {
+    case 'ready':
+      state.enemyReady = true;
+      checkBothReady();
+      break;
+    case 'shot':
+      handleIncomingShot(msg);
+      break;
+    case 'shot-result':
+      handleShotResult(msg);
+      break;
+    case 'rematch':
+      resetForRematch();
+      break;
+  }
 }
 
 /* ========== РАССТАНОВКА ========== */
@@ -185,19 +193,23 @@ function startPlacing() {
   if (state.gameState === 'placing') return;
   state.gameState = 'placing';
   showScreen('screen-place');
-  initMyBoard();
-  buildShipsList();
-  renderOwnBoard();
-  renderPreviewBoard();
-  $('btn-ready').disabled = true;
-}
-
-function initMyBoard() {
+  
   state.myBoard = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
   state.ships = [];
   state.placingShip = null;
   state.horizontal = true;
   state.placedHistory = [];
+  state.myReady = false;
+  state.enemyReady = false;
+  state.myTurn = state.isHost;
+
+  buildShipsList();
+  renderOwnBoard();
+  renderPreviewBoard();
+  
+  $('btn-ready').disabled = true;
+  $('btn-ready').textContent = '✅ Готов';
+  $('place-status').textContent = state.isHost ? 'Вы — хозяин комнаты, ходите первым' : '';
 }
 
 function buildShipsList() {
@@ -206,23 +218,16 @@ function buildShipsList() {
   let idx = 0;
   FLEET.forEach(group => {
     for (let i = 0; i < group.count; i++) {
-      const ship = { len: group.len, id: idx, placed: false };
-      state.ships.push(ship);
+      state.ships.push({ len: group.len, id: idx, placed: false, cells: null });
       const div = document.createElement('div');
       div.className = 'ship-item';
       div.dataset.id = idx;
-      div.innerHTML = `
-        ${Array(ship.len).fill('<div class="cell-dot"></div>').join('')}
-        <span class="count">×${group.count - i}</span>
-      `;
+      div.innerHTML = Array(group.len).fill('<div class="cell-dot"></div>').join('');
       div.onclick = () => selectShip(idx);
       container.appendChild(div);
       idx++;
     }
   });
-  // убираем count справа — упростим
-  container.querySelectorAll('.count').forEach(el => el.remove());
-  // Первый корабль выбран автоматически
   selectShip(0);
 }
 
@@ -238,9 +243,8 @@ function canPlace(board, x, y, len, horizontal) {
   for (let i = 0; i < len; i++) {
     const cx = horizontal ? x + i : x;
     const cy = horizontal ? y : y + i;
-    if (cx >= SIZE || cy >= SIZE) return false;
+    if (cx >= SIZE || cy >= SIZE || cx < 0 || cy < 0) return false;
     if (board[cy][cx] !== 0) return false;
-    // проверка соседей (включая углы)
     for (let dy = -1; dy <= 1; dy++) {
       for (let dx = -1; dx <= 1; dx++) {
         const nx = cx + dx, ny = cy + dy;
@@ -270,8 +274,6 @@ function placeShip(x, y) {
   state.placedHistory.push(ship.id);
 
   document.querySelector(`.ship-item[data-id="${ship.id}"]`).classList.add('placed');
-
-  // Автовыбор следующего
   const next = state.ships.findIndex(s => !s.placed);
   if (next >= 0) selectShip(next);
   else state.placingShip = null;
@@ -293,8 +295,6 @@ function renderOwnBoard() {
     for (let x = 0; x < SIZE; x++) {
       const cell = document.createElement('div');
       cell.className = 'cell' + (state.myBoard[y][x] === 1 ? ' ship' : '');
-      cell.dataset.x = x;
-      cell.dataset.y = y;
       cell.onclick = () => placeShip(x, y);
       cell.onmouseenter = () => previewHover(x, y);
       cell.onmouseleave = () => clearPreview();
@@ -327,28 +327,29 @@ function clearPreview() {
 function renderPreviewBoard() {
   const board = $('board-preview');
   board.innerHTML = '';
-  for (let y = 0; y < SIZE; y++) {
+  for (let y = 0; y < SIZE; y++)
     for (let x = 0; x < SIZE; x++) {
       const cell = document.createElement('div');
       cell.className = 'cell';
       board.appendChild(cell);
     }
-  }
 }
 
 /* ========== УПРАВЛЕНИЕ РАССТАНОВКОЙ ========== */
 $('btn-rotate').onclick = () => { state.horizontal = !state.horizontal; };
 document.addEventListener('keydown', e => {
-  if (e.key.toLowerCase() === 'r' && state.gameState === 'placing') {
-    state.horizontal = !state.horizontal;
-  }
+  if (e.key.toLowerCase() === 'r' && state.gameState === 'placing') state.horizontal = !state.horizontal;
 });
 
 $('btn-random').onclick = () => {
-  initMyBoard();
-  // Сброс UI
-  document.querySelectorAll('.ship-item').forEach(el => el.classList.remove('placed'));
+  state.myBoard = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+  state.placedHistory = [];
   state.placingShip = null;
+  state.ships.forEach(s => {
+    s.placed = false;
+    s.cells = null;
+  });
+  document.querySelectorAll('.ship-item').forEach(el => el.classList.remove('placed'));
 
   FLEET.forEach(group => {
     for (let c = 0; c < group.count; c++) {
@@ -366,19 +367,19 @@ $('btn-random').onclick = () => {
             state.myBoard[cy][cx] = 1;
             cells.push({ x: cx, y: cy });
           }
-          state.ships.push({ len: group.len, placed: true, cells });
+          const ship = state.ships.find(s => !s.placed && s.len === group.len);
+          if (ship) {
+            ship.placed = true;
+            ship.cells = cells;
+            state.placedHistory.push(ship.id);
+          }
           placed = true;
         }
       }
     }
   });
 
-  // Восстанавливаем ссылки на ships-элементы
-  state.ships.forEach((s, i) => {
-    const el = document.querySelector(`.ship-item[data-id="${i}"]`);
-    if (el) el.classList.add('placed');
-  });
-
+  document.querySelectorAll('.ship-item').forEach(el => el.classList.add('placed'));
   renderOwnBoard();
   checkReady();
 };
@@ -398,77 +399,47 @@ $('btn-undo').onclick = () => {
 };
 
 $('btn-clear').onclick = () => {
-  initMyBoard();
+  state.myBoard = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+  state.placedHistory = [];
+  state.placingShip = 0;
+  state.ships.forEach(s => {
+    s.placed = false;
+    s.cells = null;
+  });
   document.querySelectorAll('.ship-item').forEach(el => el.classList.remove('placed'));
   selectShip(0);
   renderOwnBoard();
   checkReady();
 };
 
-$('btn-ready').onclick = async () => {
+$('btn-ready').onclick = () => {
   if (!state.ships.every(s => s.placed)) return;
+  state.myReady = true;
   $('btn-ready').disabled = true;
   $('place-status').textContent = '⏳ Ожидание соперника...';
-
-  await update(ref(db, `rooms/${state.roomCode}/${state.playerId}`), {
-    ready: true,
-    board: state.myBoard,
-    ships: state.ships.map(s => s.cells)
-  });
+  state.conn.send({ type: 'ready' });
+  checkBothReady();
 };
 
+function checkBothReady() {
+  if (state.myReady && state.enemyReady && state.gameState === 'placing') {
+    state.gameState = 'battle';
+    enterBattle();
+  }
+}
+
 /* ========== БОЙ ========== */
-function enterBattle(room) {
-  state.gameState = 'playing';
-  // Инициализация представлений
-  state.enemyBoardView = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
+function enterBattle() {
   state.myShotsOnEnemy = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
   state.enemyShotsOnMe = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
-  state.shotHistory = [];
   showScreen('screen-battle');
   renderEnemyBoard();
   renderSelfBoard();
-  updateTurnIndicator(room);
+  updateTurnIndicator();
+  addLog('⚔️ Бой начался!');
 }
 
-function syncBattle(room) {
-  // Обновляем выстрелы
-  const enemyShots = room[state.enemyId]?.shots || {};
-  const myShots = room[state.playerId]?.shots || {};
-
-  // Применяем выстрелы врага на своё поле
-  Object.entries(enemyShots).forEach(([key, val]) => {
-    const [y, x] = key.split(',').map(Number);
-    if (state.enemyShotsOnMe[y][x] !== val) {
-      state.enemyShotsOnMe[y][x] = val;
-      renderSelfBoard();
-      if (val === 2) { sfx.hit(); animateCell('board-self', x, y, 'shake'); }
-      else if (val === 1) sfx.miss();
-    }
-  });
-
-  // Обновляем свои выстрелы (на случай переподключения)
-  Object.entries(myShots).forEach(([key, val]) => {
-    const [y, x] = key.split(',').map(Number);
-    if (state.myShotsOnEnemy[y][x] !== val) {
-      state.myShotsOnEnemy[y][x] = val;
-      state.enemyBoardView[y][x] = val;
-      renderEnemyBoard();
-    }
-  });
-
-  // Проверка победы
-  if (room.state === 'finished' && state.gameState !== 'finished') {
-    state.gameState = 'finished';
-    showResult(room.winner === state.playerId);
-    return;
-  }
-
-  updateTurnIndicator(room);
-}
-
-function updateTurnIndicator(room) {
-  state.myTurn = room.turn === state.playerId;
+function updateTurnIndicator() {
   const ind = $('turn-indicator');
   if (state.myTurn) {
     ind.textContent = '🎯 Ваш ход — стреляйте!';
@@ -514,134 +485,23 @@ function renderSelfBoard() {
 }
 
 function animateCell(boardId, x, y, cls) {
-  const board = $(boardId);
-  const cell = board.children[y * SIZE + x];
+  const cell = $(boardId).children[y * SIZE + x];
   if (cell) {
     cell.classList.add(cls);
     setTimeout(() => cell.classList.remove(cls), 600);
   }
 }
 
-async function fire(x, y) {
-  if (!state.myTurn) return;
-  if (state.myShotsOnEnemy[y][x] !== 0) return;
-
-  sfx.shot();
-
-  // Проверяем попадание — читаем доску врага из БД
-  const enemySnap = await get(ref(db, `rooms/${state.roomCode}/${state.enemyId}/board`));
-  const enemyBoard = enemySnap.val();
-  if (!enemyBoard) return;
-
-  const hit = enemyBoard[y][x] === 1;
-
-  // Определяем, потоплен ли корабль
-  let sunk = false;
-  let sunkCells = [];
-  if (hit) {
-    // Находим все клетки корабля, в который попали
-    const shipCells = findShipCells(enemyBoard, x, y);
-    // Проверяем, все ли они уже поражены (включая текущий выстрел)
-    const allHit = shipCells.every(c => {
-      if (c.x === x && c.y === y) return true;
-      return state.myShotsOnEnemy[c.y][c.x] === 2 || state.myShotsOnEnemy[c.y][c.x] === 3;
-    });
-    if (allHit) {
-      sunk = true;
-      sunkCells = shipCells;
-    }
-  }
-
-  // Значение для ячейки: 1=miss, 2=hit, 3=sunk
-  const shotValue = hit ? (sunk ? 3 : 2) : 1;
-
-  // Обновляем локально
-  state.myShotsOnEnemy[y][x] = shotValue;
-  state.enemyBoardView[y][x] = shotValue;
-
-  // Если sunk — помечаем все клетки корабля как 3
-  if (sunk) {
-    sunkCells.forEach(c => {
-      state.myShotsOnEnemy[c.y][c.x] = 3;
-      state.enemyBoardView[c.y][c.x] = 3;
-    });
-  }
-
-  renderEnemyBoard();
-
-  // Эффекты
-  if (hit) {
-    sfx.hit();
-    animateCell('board-enemy', x, y, 'shake');
-    if (sunk) {
-      sfx.sunk();
-      showSunkRing(x, y);
-      sunkCells.forEach(c => {
-        setTimeout(() => animateCell('board-enemy', c.x, c.y, 'shake'), 100);
-      });
-      addLog(`💥 Уничтожен ${sunkCells.length}-палубный корабль!`);
-    } else {
-      addLog(`💥 Попадание в (${x+1},${y+1})`);
-    }
-  } else {
-    sfx.miss();
-    addLog(`💧 Промах в (${x+1},${y+1})`);
-  }
-
-  // Отправляем в БД
-  const updates = {};
-  updates[`rooms/${state.roomCode}/${state.playerId}/shots/${y},${x}`] = shotValue;
-  if (sunk) {
-    sunkCells.forEach(c => {
-      updates[`rooms/${state.roomCode}/${state.playerId}/shots/${c.y},${c.x}`] = 3;
-    });
-  }
-
-  // Проверка победы: все ли корабли врага потоплены?
-  const enemyShipsSnap = await get(ref(db, `rooms/${state.roomCode}/${state.enemyId}/ships`));
-  const enemyShips = enemyShipsSnap.val() || [];
-  const allEnemySunk = enemyShips.every(shipCells =>
-    shipCells.every(c => {
-      const v = state.myShotsOnEnemy[c.y][c.x];
-      return v === 2 || v === 3;
-    })
-  );
-
-  if (allEnemySunk) {
-    updates[`rooms/${state.roomCode}/state`] = 'finished';
-    updates[`rooms/${state.roomCode}/winner`] = state.playerId;
-  } else {
-    // При попадании ход остаётся, при промахе — переходит
-    if (!hit) {
-      updates[`rooms/${state.roomCode}/turn`] = state.enemyId;
-    }
-  }
-
-  await update(ref(db), updates);
+function addLog(msg) {
+  const log = $('battle-log');
+  const div = document.createElement('div');
+  div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
 }
 
-function findShipCells(board, x, y) {
-  // BFS по горизонтали и вертикали для поиска всех клеток корабля
-  const cells = [{ x, y }];
-  // Влево-вправо
-  for (let i = x - 1; i >= 0 && board[y][i] === 1; i--) cells.push({ x: i, y });
-  for (let i = x + 1; i < SIZE && board[y][i] === 1; i++) cells.push({ x: i, y });
-  // Вверх-вниз
-  for (let i = y - 1; i >= 0 && board[i][x] === 1; i--) cells.push({ x, y: i });
-  for (let i = y + 1; i < SIZE && board[i][x] === 1; i++) cells.push({ x, y: i });
-  // Убираем дубликаты
-  const uniq = [];
-  const seen = new Set();
-  cells.forEach(c => {
-    const k = `${c.x},${c.y}`;
-    if (!seen.has(k)) { seen.add(k); uniq.push(c); }
-  });
-  return uniq;
-}
-
-function showSunkRing(x, y) {
-  const board = $('board-enemy');
-  const cell = board.children[y * SIZE + x];
+function showSunkRing(boardId, x, y) {
+  const cell = $(boardId).children[y * SIZE + x];
   if (!cell) return;
   const ring = document.createElement('div');
   ring.className = 'sunk-ring';
@@ -651,13 +511,115 @@ function showSunkRing(x, y) {
   setTimeout(() => ring.remove(), 900);
 }
 
-function addLog(msg) {
-  const log = $('battle-log');
-  const div = document.createElement('div');
-  div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-  log.appendChild(div);
-  log.scrollTop = log.scrollHeight;
-  state.shotHistory.push(msg);
+/* ========== ВЫСТРЕЛ ========== */
+function fire(x, y) {
+  if (!state.myTurn || state.pendingShot) return;
+  if (state.myShotsOnEnemy[y][x] !== 0) return;
+
+  sfx.shot();
+  state.pendingShot = { x, y };
+  state.conn.send({ type: 'shot', x, y });
+  
+  $('turn-indicator').textContent = '⏳ Ждем ответа...';
+  $('turn-indicator').classList.remove('my-turn');
+}
+
+function handleIncomingShot(msg) {
+  const { x, y } = msg;
+  const hit = state.myBoard[y][x] === 1;
+  let sunk = false, sunkCells = [], allSunk = false;
+
+  if (hit) {
+    const shipCells = findShipCells(state.myBoard, x, y);
+    const allHit = shipCells.every(c => {
+      if (c.x === x && c.y === y) return true;
+      const v = state.enemyShotsOnMe[c.y][c.x];
+      return v === 2 || v === 3;
+    });
+    if (allHit) { sunk = true; sunkCells = shipCells; }
+  }
+
+  state.enemyShotsOnMe[y][x] = hit ? (sunk ? 3 : 2) : 1;
+  if (sunk) sunkCells.forEach(c => state.enemyShotsOnMe[c.y][c.x] = 3);
+
+  allSunk = state.ships.every(ship =>
+    ship.cells.every(c => {
+      const v = state.enemyShotsOnMe[c.y][c.x];
+      return v === 2 || v === 3;
+    })
+  );
+
+  state.conn.send({ type: 'shot-result', x, y, hit, sunk, sunkCells, allSunk });
+
+  renderSelfBoard();
+
+  if (hit) {
+    sfx.hit();
+    animateCell('board-self', x, y, 'shake');
+    state.myTurn = false;
+  } else {
+    sfx.miss();
+    state.myTurn = true;
+  }
+
+  if (sunk) {
+    sfx.sunk();
+    sunkCells.forEach(c => showSunkRing('board-self', c.x, c.y));
+  }
+  
+  updateTurnIndicator();
+
+  if (allSunk) {
+    state.gameState = 'finished';
+    setTimeout(() => showResult(false), 900);
+  }
+}
+
+function handleShotResult(msg) {
+  const { x, y, hit, sunk, sunkCells, allSunk } = msg;
+  state.pendingShot = null;
+
+  state.myShotsOnEnemy[y][x] = hit ? (sunk ? 3 : 2) : 1;
+  if (sunk) sunkCells.forEach(c => state.myShotsOnEnemy[c.y][c.x] = 3);
+
+  renderEnemyBoard();
+
+  if (hit) {
+    sfx.hit();
+    animateCell('board-enemy', x, y, 'shake');
+    addLog(`💥 Попадание в (${x+1},${y+1})`);
+  } else {
+    sfx.miss();
+    addLog(`💧 Промах в (${x+1},${y+1})`);
+  }
+
+  if (sunk) {
+    sfx.sunk();
+    sunkCells.forEach(c => setTimeout(() => showSunkRing('board-enemy', c.x, c.y), 100));
+    addLog(`☠️ Уничтожен ${sunkCells.length}-палубный!`);
+  }
+
+  state.myTurn = hit;
+  updateTurnIndicator();
+
+  if (allSunk) {
+    state.gameState = 'finished';
+    setTimeout(() => showResult(true), 900);
+  }
+}
+
+function findShipCells(board, x, y) {
+  const cells = [{ x, y }];
+  for (let i = x - 1; i >= 0 && board[y][i] === 1; i--) cells.push({ x: i, y });
+  for (let i = x + 1; i < SIZE && board[y][i] === 1; i++) cells.push({ x: i, y });
+  for (let i = y - 1; i >= 0 && board[i][x] === 1; i--) cells.push({ x, y: i });
+  for (let i = y + 1; i < SIZE && board[i][x] === 1; i++) cells.push({ x, y: i });
+  const uniq = [], seen = new Set();
+  cells.forEach(c => {
+    const k = `${c.x},${c.y}`;
+    if (!seen.has(k)) { seen.add(k); uniq.push(c); }
+  });
+  return uniq;
 }
 
 /* ========== РЕЗУЛЬТАТ ========== */
@@ -666,32 +628,30 @@ function showResult(win) {
   const title = $('result-title');
   title.textContent = win ? '🏆 Победа!' : '💀 Поражение';
   title.className = win ? 'win' : 'lose';
-  $('result-text').textContent = win
-    ? 'Вы уничтожили весь флот соперника!'
-    : 'Ваш флот потоплен. В следующий раз повезёт!';
+  $('result-text').textContent = win ? 'Вы уничтожили весь флот соперника!' : 'Ваш флот потоплен.';
   win ? sfx.win() : sfx.lose();
 }
 
-$('btn-again').onclick = async () => {
-  // Сброс комнаты для новой игры
-  await update(ref(db, `rooms/${state.roomCode}`), {
-    state: 'placing',
-    turn: 'player1',
-    winner: null
-  });
-  await update(ref(db, `rooms/${state.roomCode}/player1`), { ready: false, board: null, shots: null });
-  await update(ref(db, `rooms/${state.roomCode}/player2`), { ready: false, board: null, shots: null });
+$('btn-again').onclick = () => {
+  state.conn.send({ type: 'rematch' });
+  resetForRematch();
+};
 
-  // Сброс состояния
+function resetForRematch() {
+  state.myReady = false;
+  state.enemyReady = false;
+  state.myTurn = false;
   state.myBoard = [];
-  state.enemyBoardView = [];
   state.myShotsOnEnemy = [];
   state.enemyShotsOnMe = [];
   state.ships = [];
-  state.shotHistory = [];
-  state.gameState = 'placing';
-
+  state.pendingShot = null;
+  state.gameState = 'waiting';
+  $('battle-log').innerHTML = '';
   startPlacing();
-};
+}
 
-$('btn-exit').onclick = () => location.reload();
+$('btn-exit').onclick = () => {
+  if (state.conn) state.conn.close();
+  location.reload();
+};
