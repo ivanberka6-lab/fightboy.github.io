@@ -1,4 +1,12 @@
-/* ========== КОНСТАНТЫ ========== */
+/* ========== СПИСОК СЕРВЕРОВ (если один падает, переключается на другой) ========== */
+const PEER_SERVERS = [
+  { host: '0.peerjs.com', port: 443, path: '/', secure: true },
+  { host: 'pe1.peerjs.com', port: 443, path: '/', secure: true },
+  { host: 'pe2.peerjs.com', port: 443, path: '/', secure: true },
+  { host: 'peerjs-server.onrender.com', port: 443, path: '/', secure: true },
+];
+
+/* ========== КОНСТАНТЫ ИГРЫ ========== */
 const SIZE = 10;
 const FLEET = [
   { len: 4, count: 1 },
@@ -26,9 +34,9 @@ const state = {
   gameState: 'menu',
   myTurn: false,
   pendingShot: null,
-  heartbeatInterval: null,
-  lastPing: Date.now(),
-  reconnectAttempts: 0
+  heartbeatTimer: null,
+  reconnectAttempts: 0,
+  currentServerIdx: 0
 };
 
 /* ========== УТИЛИТЫ ========== */
@@ -47,69 +55,33 @@ function showScreen(id) {
   $(id).classList.add('active');
 }
 
-function updateConnectionStatus(ok, msg = '') {
-  const els = [$('connection-indicator'), $('connection-indicator-battle')];
+function log(msg, type = 'info') {
+  console.log(`[${type.toUpperCase()}] ${msg}`);
+}
+
+function setServerStatus(text, color = '#95a5a6') {
+  const el = $('server-status');
+  if (el) {
+    el.textContent = text;
+    el.style.color = color;
+  }
+}
+
+function setConnStatus(ok) {
+  const els = [$('conn-indicator'), $('conn-indicator-battle')];
   els.forEach(el => {
     if (!el) return;
-    if (ok) {
-      el.textContent = '🟢 Соединение стабильно';
-      el.style.color = '#2ecc71';
-    } else {
-      el.textContent = '🔴 ' + (msg || 'Соединение потеряно!');
-      el.style.color = '#e74c3c';
-    }
+    el.textContent = ok ? '🟢 Онлайн' : '🔴 Соединение потеряно!';
+    el.style.color = ok ? '#2ecc71' : '#e74c3c';
+    el.style.backgroundColor = ok ? 'rgba(46,204,113,0.1)' : 'rgba(231,76,60,0.1)';
   });
 }
 
-function startHeartbeat() {
-  if (state.heartbeatInterval) clearInterval(state.heartbeatInterval);
-  
-  state.heartbeatInterval = setInterval(() => {
-    if (!state.conn || !state.conn.open) {
-      handleDisconnect();
-      return;
-    }
-    
-    try {
-      state.conn.send({ type: 'ping', time: Date.now() });
-      
-      // Проверяем, не слишком ли давно был последний ответ
-      if (Date.now() - state.lastPing > 15000) {
-        console.warn('No heartbeat response, reconnecting...');
-        handleDisconnect();
-      }
-    } catch (e) {
-      console.error('Heartbeat error:', e);
-      handleDisconnect();
-    }
-  }, 5000);
-}
-
-function stopHeartbeat() {
-  if (state.heartbeatInterval) {
-    clearInterval(state.heartbeatInterval);
-    state.heartbeatInterval = null;
-  }
-}
-
-function handleDisconnect() {
-  stopHeartbeat();
-  updateConnectionStatus(false, 'Соперник отключился!');
-  
-  if (state.gameState === 'placing' || state.gameState === 'battle') {
-    setTimeout(() => {
-      if (confirm('Соединение потеряно! Вернуться в меню?')) {
-        location.reload();
-      }
-    }, 500);
-  }
-}
-
 /* ========== ЗВУКИ ========== */
-const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
+let audioCtx;
 function beep(freq, dur = 0.1, type = 'sine', vol = 0.1) {
   try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const osc = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
     osc.type = type;
@@ -135,8 +107,102 @@ const sfx = {
   lose: () => [392, 330, 262, 196].forEach((f, i) => setTimeout(() => beep(f, 0.25, 'sine', 0.15), i * 200))
 };
 
-/* ========== МЕНЮ ========== */
-$('btn-create').onclick = () => {
+/* ========== СОЗДАНИЕ PEER С FALLBACK ========== */
+function createPeer(id = null) {
+  return new Promise((resolve, reject) => {
+    const tryServer = (idx) => {
+      if (idx >= PEER_SERVERS.length) {
+        reject(new Error('Все серверы недоступны. Попробуйте позже или используйте VPN.'));
+        return;
+      }
+
+      const server = PEER_SERVERS[idx];
+      setServerStatus(`🔌 Сервер ${idx + 1}/${PEER_SERVERS.length}: ${server.host}`, '#f39c12');
+      log(`Пробуем сервер: ${server.host}`);
+
+      const peer = id ? new Peer(id, server) : new Peer(server);
+
+      const timeout = setTimeout(() => {
+        peer.destroy();
+        log(`Таймаут: ${server.host}`, 'warn');
+        tryServer(idx + 1);
+      }, 8000);
+
+      peer.on('open', (peerId) => {
+        clearTimeout(timeout);
+        state.myId = peerId;
+        state.currentServerIdx = idx;
+        setServerStatus(`✅ Сервер: ${server.host}`, '#2ecc71');
+        log(`Подключено к ${server.host} как ${peerId}`);
+        resolve(peer);
+      });
+
+      peer.on('error', (err) => {
+        clearTimeout(timeout);
+        log(`Ошибка ${server.host}: ${err.type} - ${err.message}`, 'error');
+
+        const fatalErrors = ['network', 'server-error', 'ssl-unavailable', 'socket-error', 'socket-closed'];
+        if (fatalErrors.includes(err.type) || err.type === 'unavailable-id') {
+          peer.destroy();
+          setTimeout(() => tryServer(idx + 1), 500);
+        } else {
+          // Не фатальная ошибка - оставляем peer
+          state.myId = peer.id;
+          state.currentServerIdx = idx;
+          setServerStatus(`✅ Сервер: ${server.host}`, '#2ecc71');
+          resolve(peer);
+        }
+      });
+    };
+
+    tryServer(0);
+  });
+}
+
+/* ========== HEARTBEAT (проверка связи) ========== */
+function startHeartbeat() {
+  stopHeartbeat();
+  state.heartbeatTimer = setInterval(() => {
+    if (state.conn && state.conn.open) {
+      try {
+        state.conn.send({ type: 'ping', t: Date.now() });
+      } catch (e) {
+        handleDisconnect();
+      }
+    } else {
+      handleDisconnect();
+    }
+  }, 4000);
+}
+
+function stopHeartbeat() {
+  if (state.heartbeatTimer) {
+    clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = null;
+  }
+}
+
+let disconnectShown = false;
+function handleDisconnect() {
+  if (disconnectShown) return;
+  disconnectShown = true;
+  stopHeartbeat();
+  setConnStatus(false);
+  log('Соединение потеряно!', 'error');
+
+  if (state.gameState === 'placing' || state.gameState === 'battle') {
+    setTimeout(() => {
+      if (confirm('❌ Соединение с соперником потеряно.\nВернуться в меню?')) {
+        location.reload();
+      } else {
+        disconnectShown = false;
+      }
+    }, 300);
+  }
+}
+
+/* ========== МЕНЮ: СОЗДАНИЕ ========== */
+$('btn-create').onclick = async () => {
   $('btn-create').disabled = true;
   $('btn-join').disabled = true;
 
@@ -144,92 +210,163 @@ $('btn-create').onclick = () => {
   state.isHost = true;
   state.roomCode = code;
 
+  setServerStatus('🔌 Поиск сервера...', '#f39c12');
+  $('room-code-display').textContent = code.toUpperCase();
+  $('room-info').classList.remove('hidden');
+
   try {
-    state.peer = new Peer('bs-' + code);
-  } catch (e) {
-    alert('Ошибка PeerJS: ' + e.message);
+    // Создаём peer с ID комнаты (с fallback)
+    state.peer = await createPeer('bs-' + code);
+
+    $('room-status').textContent = '⏳ Ожидание соперника...';
+
+    state.peer.on('connection', (conn) => {
+      if (state.conn) { conn.close(); return; }
+      state.conn = conn;
+      setupConn(conn);
+      $('room-status').textContent = '✅ Соперник найден!';
+    });
+
+    state.peer.on('error', (err) => {
+      log(`Peer error: ${err.type}`, 'error');
+
+      if (err.type === 'unavailable-id') {
+        state.peer.destroy();
+        setTimeout(() => $('btn-create').click(), 100);
+      } else if (err.type === 'peer-unavailable') {
+        // Игнорируем
+      } else if (err.type === 'network' || err.type === 'disconnected') {
+        // Попробуем переподключиться
+        if (!state.conn || !state.conn.open) {
+          reconnectPeer();
+        }
+      }
+    });
+
+    state.peer.on('disconnected', () => {
+      log('Peer отключился, переподключаемся...', 'warn');
+      if (state.peer && !state.peer.destroyed) {
+        setTimeout(() => {
+          if (state.peer && !state.peer.destroyed) {
+            state.peer.reconnect();
+          }
+        }, 1000);
+      }
+    });
+
+  } catch (err) {
+    alert('❌ Ошибка подключения:\n' + err.message);
     $('btn-create').disabled = false;
     $('btn-join').disabled = false;
-    return;
+    $('room-info').classList.add('hidden');
+    setServerStatus('❌ Ошибка', '#e74c3c');
   }
-
-  state.peer.on('open', () => {
-    state.myId = state.peer.id;
-    $('room-code-display').textContent = code.toUpperCase();
-    $('room-info').classList.remove('hidden');
-    $('room-status').textContent = '⏳ Ожидание соперника...';
-  });
-
-  state.peer.on('connection', (conn) => {
-    if (state.conn) { conn.close(); return; }
-    state.conn = conn;
-    setupConn(conn);
-    $('room-status').textContent = '✅ Соперник найден, соединяемся...';
-  });
-
-  state.peer.on('error', (err) => {
-    console.error('PeerJS:', err);
-    if (err.type === 'unavailable-id') {
-      state.peer.destroy();
-      setTimeout(() => $('btn-create').click(), 100);
-    } else {
-      alert('Ошибка: ' + err.type + '\n' + (err.message || ''));
-      $('btn-create').disabled = false;
-      $('btn-join').disabled = false;
-    }
-  });
 };
 
-$('btn-join').onclick = () => {
+/* ========== МЕНЮ: ПРИСОЕДИНЕНИЕ ========== */
+$('btn-join').onclick = async () => {
   const code = $('input-code').value.trim().toLowerCase();
-  if (code.length !== 6) return alert('Введите 6-символьный код');
+  if (code.length !== 6) {
+    alert('Введите 6-символьный код');
+    return;
+  }
 
   $('btn-create').disabled = true;
   $('btn-join').disabled = true;
   state.isHost = false;
   state.roomCode = code;
-  state.peer = new Peer();
 
+  setServerStatus('🔌 Поиск сервера...', '#f39c12');
   $('room-code-display').textContent = code.toUpperCase();
   $('room-info').classList.remove('hidden');
-  $('room-status').textContent = '🔄 Подключение к серверу...';
+  $('room-status').textContent = '🔄 Подключение...';
 
-  state.peer.on('open', () => {
-    state.myId = state.peer.id;
+  try {
+    state.peer = await createPeer();
+
     $('room-status').textContent = '🔄 Ищем комнату...';
-    
-    // Попытка подключения с retry
-    const connectWithRetry = (attempt = 1) => {
-      state.conn = state.peer.connect('bs-' + code, { reliable: true });
-      setupConn(state.conn);
-      
-      // Таймаут на подключение
-      setTimeout(() => {
-        if (!state.conn.open && attempt < 3) {
-          console.log(`Connection attempt ${attempt} failed, retrying...`);
-          state.conn.close();
-          connectWithRetry(attempt + 1);
-        }
-      }, 5000);
-    };
-    
-    connectWithRetry();
-  });
 
-  state.peer.on('error', (err) => {
-    console.error('PeerJS:', err);
-    if (err.type === 'peer-unavailable') {
-      alert('Комната не найдена. Проверь код.');
-      $('btn-create').disabled = false;
-      $('btn-join').disabled = false;
-      $('room-info').classList.add('hidden');
-    } else {
-      alert('Ошибка: ' + err.type);
-      $('btn-create').disabled = false;
-      $('btn-join').disabled = false;
-    }
-  });
+    // Подключаемся с retry
+    const tryConnect = async (attempt = 1) => {
+      try {
+        state.conn = state.peer.connect('bs-' + code, { reliable: true });
+        setupConn(state.conn);
+
+        // Таймаут ожидания ответа
+        await new Promise((resolve) => {
+          const t = setTimeout(() => {
+            if (!state.conn.open && attempt < 3) {
+              log(`Попытка ${attempt} неудачна, пробуем ещё раз...`, 'warn');
+              state.conn.close();
+              tryConnect(attempt + 1);
+            }
+            resolve();
+          }, 5000);
+
+          state.conn.once('open', () => {
+            clearTimeout(t);
+            resolve();
+          });
+        });
+      } catch (e) {
+        log(`Ошибка подключения: ${e}`, 'error');
+        if (attempt < 3) tryConnect(attempt + 1);
+      }
+    };
+
+    await tryConnect();
+
+    state.peer.on('error', (err) => {
+      log(`Peer error: ${err.type}`, 'error');
+
+      if (err.type === 'peer-unavailable') {
+        alert('❌ Комната не найдена. Проверь код.');
+        $('btn-create').disabled = false;
+        $('btn-join').disabled = false;
+        $('room-info').classList.add('hidden');
+      } else if (err.type === 'network' || err.type === 'disconnected') {
+        if (!state.conn || !state.conn.open) {
+          reconnectPeer();
+        }
+      }
+    });
+
+    state.peer.on('disconnected', () => {
+      log('Peer отключился, переподключаемся...', 'warn');
+      if (state.peer && !state.peer.destroyed) {
+        setTimeout(() => {
+          if (state.peer && !state.peer.destroyed) {
+            state.peer.reconnect();
+          }
+        }, 1000);
+      }
+    });
+
+  } catch (err) {
+    alert('❌ Ошибка подключения:\n' + err.message);
+    $('btn-create').disabled = false;
+    $('btn-join').disabled = false;
+    $('room-info').classList.add('hidden');
+    setServerStatus('❌ Ошибка', '#e74c3c');
+  }
 };
+
+/* ========== ПЕРЕПОДКЛЮЧЕНИЕ ========== */
+async function reconnectPeer() {
+  if (state.reconnectAttempts >= 5) {
+    handleDisconnect();
+    return;
+  }
+  state.reconnectAttempts++;
+  log(`Переподключение #${state.reconnectAttempts}...`, 'warn');
+  setServerStatus(`🔄 Переподключение #${state.reconnectAttempts}...`, '#f39c12');
+
+  setTimeout(() => {
+    if (state.peer && !state.peer.destroyed) {
+      state.peer.reconnect();
+    }
+  }, 2000 * state.reconnectAttempts);
+}
 
 $('btn-copy').onclick = () => {
   navigator.clipboard.writeText(state.roomCode.toUpperCase());
@@ -241,57 +378,54 @@ $('btn-copy').onclick = () => {
 function setupConn(conn) {
   conn.on('open', () => {
     $('room-status').textContent = '✅ Подключено!';
-    state.lastPing = Date.now();
+    state.reconnectAttempts = 0;
+    disconnectShown = false;
+    setConnStatus(true);
     startHeartbeat();
-    updateConnectionStatus(true);
     setTimeout(() => startPlacing(), 400);
   });
-  
+
   conn.on('data', handleMessage);
-  
+
   conn.on('close', () => {
-    console.log('Connection closed');
+    log('Соединение закрыто', 'warn');
     handleDisconnect();
   });
-  
+
   conn.on('error', (e) => {
-    console.error('Conn error:', e);
+    log(`Ошибка соединения: ${e}`, 'error');
     handleDisconnect();
   });
 }
 
 function handleMessage(msg) {
-  state.lastPing = Date.now();
-  
+  if (!msg || typeof msg !== 'object') return;
+
   switch (msg.type) {
     case 'ping':
-      // Ответ на ping
       if (state.conn && state.conn.open) {
-        try {
-          state.conn.send({ type: 'pong', time: msg.time });
-        } catch (e) {}
+        try { state.conn.send({ type: 'pong', t: msg.t }); } catch (e) {}
       }
       break;
-      
     case 'pong':
-      // Получили ответ, соединение живо
+      // heartbeat ok
       break;
-      
     case 'ready':
       state.enemyReady = true;
       checkBothReady();
       break;
-      
     case 'shot':
       handleIncomingShot(msg);
       break;
-      
     case 'shot-result':
       handleShotResult(msg);
       break;
-      
     case 'rematch':
       resetForRematch();
+      break;
+    case 'bye':
+      log('Соперник вышел', 'warn');
+      handleDisconnect();
       break;
   }
 }
@@ -301,7 +435,7 @@ function startPlacing() {
   if (state.gameState === 'placing') return;
   state.gameState = 'placing';
   showScreen('screen-place');
-  
+
   state.myBoard = Array.from({ length: SIZE }, () => Array(SIZE).fill(0));
   state.ships = [];
   state.placingShip = null;
@@ -314,7 +448,7 @@ function startPlacing() {
   buildShipsList();
   renderOwnBoard();
   renderPreviewBoard();
-  
+
   $('btn-ready').disabled = true;
   $('btn-ready').textContent = '✅ Готов';
   $('place-status').textContent = state.isHost ? 'Вы — хозяин комнаты, ходите первым' : '';
@@ -525,7 +659,7 @@ $('btn-ready').onclick = () => {
   state.myReady = true;
   $('btn-ready').disabled = true;
   $('place-status').textContent = '⏳ Ожидание соперника...';
-  state.conn.send({ type: 'ready' });
+  trySend({ type: 'ready' });
   checkBothReady();
 };
 
@@ -619,6 +753,22 @@ function showSunkRing(boardId, x, y) {
   setTimeout(() => ring.remove(), 900);
 }
 
+/* ========== БЕЗОПАСНАЯ ОТПРАВКА ========== */
+function trySend(data) {
+  if (!state.conn || !state.conn.open) {
+    log('Не удалось отправить: соединение закрыто', 'warn');
+    return false;
+  }
+  try {
+    state.conn.send(data);
+    return true;
+  } catch (e) {
+    log(`Ошибка отправки: ${e}`, 'error');
+    handleDisconnect();
+    return false;
+  }
+}
+
 /* ========== ВЫСТРЕЛ ========== */
 function fire(x, y) {
   if (!state.myTurn || state.pendingShot) return;
@@ -626,8 +776,8 @@ function fire(x, y) {
 
   sfx.shot();
   state.pendingShot = { x, y };
-  state.conn.send({ type: 'shot', x, y });
-  
+  trySend({ type: 'shot', x, y });
+
   $('turn-indicator').textContent = '⏳ Ждем ответа...';
   $('turn-indicator').classList.remove('my-turn');
 }
@@ -657,7 +807,7 @@ function handleIncomingShot(msg) {
     })
   );
 
-  state.conn.send({ type: 'shot-result', x, y, hit, sunk, sunkCells, allSunk });
+  trySend({ type: 'shot-result', x, y, hit, sunk, sunkCells, allSunk });
 
   renderSelfBoard();
 
@@ -674,7 +824,7 @@ function handleIncomingShot(msg) {
     sfx.sunk();
     sunkCells.forEach(c => showSunkRing('board-self', c.x, c.y));
   }
-  
+
   updateTurnIndicator();
 
   if (allSunk) {
@@ -742,7 +892,7 @@ function showResult(win) {
 }
 
 $('btn-again').onclick = () => {
-  state.conn.send({ type: 'rematch' });
+  trySend({ type: 'rematch' });
   resetForRematch();
 };
 
@@ -761,16 +911,14 @@ function resetForRematch() {
 }
 
 $('btn-exit').onclick = () => {
+  trySend({ type: 'bye' });
   if (state.conn) state.conn.close();
+  if (state.peer) state.peer.destroy();
   location.reload();
 };
 
-/* ========== ОБРАБОТКА ЗАКРЫТИЯ ВКЛАДКИ ========== */
+/* ========== ЗАКРЫТИЕ ВКЛАДКИ ========== */
 window.addEventListener('beforeunload', () => {
   stopHeartbeat();
-  if (state.conn) {
-    try {
-      state.conn.send({ type: 'disconnect' });
-    } catch (e) {}
-  }
+  trySend({ type: 'bye' });
 });
