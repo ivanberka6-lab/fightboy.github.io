@@ -46,7 +46,6 @@
     font-size: 1.1em;
   }
 
-  /* ===== МЕНЮ ===== */
   .menu-box {
     max-width: 400px;
     margin: 0 auto;
@@ -94,7 +93,6 @@
     box-shadow: 0 0 0 3px rgba(66,153,225,0.2);
   }
 
-  /* ===== КНОПКИ ===== */
   .btn {
     width: 100%;
     padding: 14px 20px;
@@ -133,7 +131,6 @@
     margin: 2px;
   }
 
-  /* ===== ИНФО О КОМНАТЕ ===== */
   .room-info {
     max-width: 400px;
     margin: 20px auto 0;
@@ -158,7 +155,6 @@
     color: #a0aec0;
   }
 
-  /* ===== РАССТАНОВКА ===== */
   .place-layout {
     display: grid;
     grid-template-columns: 280px 1fr;
@@ -220,7 +216,6 @@
     min-height: 20px;
   }
 
-  /* ===== ДОСКИ ===== */
   .boards {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -318,7 +313,6 @@
     background: linear-gradient(135deg, #e53e3e, #c53030);
   }
 
-  /* ===== БОЙ ===== */
   .battle-layout {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -364,8 +358,7 @@
     color: #a0aec0;
   }
 
-  /* ===== ИНДИКАТОРЫ СОЕДИНЕНИЯ ===== */
-  .net-ind, .conn-indicator, .connection-indicator, .connection-status {
+  .net-ind {
     text-align: center;
     padding: 8px;
     margin: 10px 0;
@@ -375,7 +368,6 @@
     color: #2ecc71;
   }
 
-  /* ===== РЕЗУЛЬТАТ ===== */
   .result-content {
     text-align: center;
     padding: 40px 20px;
@@ -409,7 +401,6 @@
     margin: 10px auto;
   }
 
-  /* ===== СКРОЛЛБАР ===== */
   ::-webkit-scrollbar { width: 8px; }
   ::-webkit-scrollbar-track { background: rgba(0,0,0,0.2); }
   ::-webkit-scrollbar-thumb {
@@ -418,7 +409,6 @@
   }
   ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.3); }
 
-  /* ===== АДАПТИВ ===== */
   @media (max-width: 500px) {
     h1 { font-size: 1.8em; }
     h2 { font-size: 1.4em; }
@@ -510,7 +500,9 @@
 </div>
 
 <script type="module">
-import { joinRoom } from 'https://esm.sh/trystero/torrent';
+// Используем конкретную рабочую версию Trystero
+import * as trystero from 'https://cdn.jsdelivr.net/npm/trystero@0.20.0/src/torrent.min.js';
+const { joinRoom } = trystero;
 
 /* ========== КОНСТАНТЫ ========== */
 const SIZE = 10;
@@ -520,7 +512,7 @@ const FLEET = [
   { len: 2, count: 3 },
   { len: 1, count: 4 }
 ];
-const APP_ID = 'ivanberka6_fightboy_v3';
+const APP_ID = 'ivanberka6_fightboy_v4';
 
 /* ========== СОСТОЯНИЕ ========== */
 const state = {
@@ -1120,7 +1112,7 @@ window.addEventListener('beforeunload', () => {
   if (state.room) state.room.leave();
 });
 
-console.log('⚓ Морской бой загружен (Trystero/BitTorrent)');
+console.log('⚓ Морской бой загружен (Trystero/BitTorrent v0.20.0)');
 </script>
 </body>
 </html>
